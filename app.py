@@ -3,7 +3,6 @@ import os
 import tempfile
 import subprocess
 import base64
-from moviepy.editor import VideoFileClip
 import whisper
 
 
@@ -46,7 +45,22 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🎬 動画シーン解析ツール（フルリライト版）")
+st.title("🎬 動画シーン解析ツール（moviepy なし版）")
+
+
+# ==============================
+# FFprobe で動画秒数を取得
+# ==============================
+def get_video_duration(video_path):
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video_path
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return float(result.stdout.decode().strip())
 
 
 # ==============================
@@ -55,7 +69,6 @@ st.title("🎬 動画シーン解析ツール（フルリライト版）")
 def extract_scenes_ffmpeg(video_path):
     tmp_dir = tempfile.mkdtemp()
 
-    # SceneDetect + FFmpeg の閾値
     threshold = "0.3"
 
     cmd = [
@@ -68,7 +81,6 @@ def extract_scenes_ffmpeg(video_path):
 
     subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    # ファイル名順に並ぶ
     image_paths = sorted(
         [os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir) if f.endswith(".jpg")]
     )
@@ -90,31 +102,25 @@ def transcribe_audio(video_path):
 
 
 # ==============================
-# Google スプレッドシート用 TSV（横3行×n列）
+# TSV（横 3 行 × n 列）
 # ==============================
 def generate_tsv_horizontal(image_paths, times, transcripts):
-    # 1行目（時間）
     time_row = ["時間"] + [str(t) for t in times]
 
-    # 2行目（画像）
     image_row = ["画像"]
     for img in image_paths:
         with open(img, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
-        img_formula = f'=IMAGE("data:image/jpeg;base64,{b64}")'
-        image_row.append(img_formula)
+        formula = f'=IMAGE("data:image/jpeg;base64,{b64}")'
+        image_row.append(formula)
 
-    # 3行目（テキスト）
     text_row = ["テキスト"] + transcripts
 
-    # TSV化
-    tsv = "\n".join([
+    return "\n".join([
         "\t".join(time_row),
         "\t".join(image_row),
         "\t".join(text_row)
     ])
-
-    return tsv
 
 
 # ==============================
@@ -129,44 +135,38 @@ if uploaded:
 
     st.success("動画を読み込みました！")
 
-    # 動画情報
-    video = VideoFileClip(video_path)
-    duration = video.duration
-    st.write(f"動画長さ：{duration:.1f} 秒")
+    # 動画秒数取得（moviepy 不要）
+    duration = get_video_duration(video_path)
+    st.write(f"動画の長さ：{duration:.1f} 秒")
 
     # シーン抽出
     with st.spinner("シーン抽出中…"):
         scene_images = extract_scenes_ffmpeg(video_path)
 
-    st.write(f"抽出されたシーン数：{len(scene_images)}")
+    st.write(f"抽出シーン数：{len(scene_images)}")
 
-    # 各画像の秒数取得（moviepy）
+    # シーン秒数（推定）
     times = []
-    for img in scene_images:
-        filename = os.path.basename(img)
-        idx = int(filename.replace("scene_", "").replace(".jpg", ""))
-        t = (idx - 1) * 1.2  # 適当だが SceneDetect が秒数を取らないため補間
-        times.append(round(t, 1))
+    for i, img in enumerate(scene_images):
+        sec = round(i * (duration / max(1, len(scene_images))), 1)
+        times.append(sec)
 
-    # Whisper テキスト
-    with st.spinner("音声からテキスト解析中（Whisper-small）…"):
+    # Whisper
+    with st.spinner("Whisper-small で音声解析中…"):
         transcript = transcribe_audio(video_path)
 
-    # シーン単位のテキスト（簡易分割）
-    transcripts = []
-    chunk = len(scene_images)
+    # シーン単位に均等割り
     words = transcript.split()
-
+    chunk = len(scene_images)
+    transcripts = []
     if chunk > 0:
         split_size = max(1, len(words) // chunk)
-
         for i in range(chunk):
             part = words[i * split_size:(i + 1) * split_size]
             transcripts.append(" ".join(part))
 
-
     # ==============================
-    # UI（横スクロールカード）
+    # UI（横カード）
     # ==============================
     st.subheader("🔍 自動抽出されたシーン")
 
@@ -183,15 +183,14 @@ if uploaded:
         </div>
         """
     html += "</div>"
-
     st.markdown(html, unsafe_allow_html=True)
 
     # ==============================
-    # TSV出力
+    # TSV 出力
     # ==============================
-    st.subheader("📋 Google スプレッドシート用（横3行 × シーン数列）")
+    st.subheader("📋 Google スプレッドシート用 TSV（横3行×n列）")
 
     if st.button("TSV を生成"):
         tsv = generate_tsv_horizontal(scene_images, times, transcripts)
         st.code(tsv, language="text")
-        st.success("このTSVをスプレッドシートに貼ると、横に整列します！")
+        st.success("このままスプレッドシートに貼り付け可能！")
