@@ -6,6 +6,8 @@ import shutil
 import datetime
 from scenedetect import VideoManager, SceneManager
 from scenedetect.detectors import ContentDetector
+# pandasはテーブル表示のために使用します
+import pandas as pd
 
 # --- 設定 ---
 UPLOAD_DIR = "temp_uploads"
@@ -15,10 +17,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # --- 関数: 時間表示 ---
 def format_time(seconds):
-    seconds = int(seconds)
-    minutes = seconds // 60
-    rem_seconds = seconds % 60
-    return f"{minutes:02}:{rem_seconds:02}"
+    return str(datetime.timedelta(seconds=int(seconds)))
 
 # --- 関数: フォルダリセット ---
 def clear_output_folder():
@@ -30,7 +29,7 @@ def clear_output_folder():
 def extract_scenes(video_path):
     video_manager = VideoManager([video_path])
     scene_manager = SceneManager()
-    # threshold=27.0 は標準。動きが激しい動画で細切れになる場合は35.0くらいに上げる
+    # threshold=27.0 は感度の標準値。
     scene_manager.add_detector(ContentDetector(threshold=27.0))
     
     video_manager.start()
@@ -38,155 +37,157 @@ def extract_scenes(video_path):
     scene_list = scene_manager.get_scene_list()
     
     cap = cv2.VideoCapture(video_path)
-    # 動画の総再生時間を取得
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-    duration = frame_count / fps
-    
     scenes_data = []
-    
-    # 最初のシーン(0秒地点)を強制追加するか判定
-    start_time_offset = 0.0
-    if not scene_list or scene_list[0][0].get_seconds() > 1.0:
-        scenes_data.append({
-            "start": 0.0,
-            "end": scene_list[0][0].get_seconds() if scene_list else duration,
-            "time_str": format_time(0),
-            "img_path": None # 後で撮影
-        })
 
-    # シーンリストを整形
+    progress_bar = st.progress(0, text="シーン検出中...")
+    total_scenes = len(scene_list)
+    
+    # 最初のシーンの開始時間は必ず0秒とする
+    if total_scenes > 0 and scene_list[0][0].get_seconds() > 0:
+         start_time = 0.0
+         cap.set(cv2.CAP_PROP_POS_MSEC, start_time * 1000)
+         ret, frame = cap.read()
+         if ret:
+             img_filename = f"scene_start_0s.jpg"
+             img_path = os.path.join(OUTPUT_DIR, img_filename)
+             cv2.imwrite(img_path, frame)
+             scenes_data.append({
+                 "time_str": format_time(start_time),
+                 "seconds": start_time,
+                 "img_path": img_path
+             })
+
     for i, scene in enumerate(scene_list):
-        start = scene[0].get_seconds()
-        end = scene[1].get_seconds()
-        scenes_data.append({
-            "start": start,
-            "end": end,
-            "time_str": format_time(start),
-            "img_path": None
-        })
-    
-    # 画像保存処理
-    progress_bar = st.progress(0, text="シーン画像を抽出中...")
-    total_scenes = len(scenes_data)
-    
-    for i, data in enumerate(scenes_data):
-        # シーン開始直後だとブレていることがあるので、0.5秒後などを取得してみる
-        # ただしシーンが短すぎる場合は開始時点を使う
-        scene_len = data["end"] - data["start"]
-        capture_point = data["start"] + (0.5 if scene_len > 1.0 else 0.0)
+        start_time = scene[0].get_seconds()
         
-        cap.set(cv2.CAP_PROP_POS_MSEC, capture_point * 1000)
+        cap.set(cv2.CAP_PROP_POS_MSEC, start_time * 1000)
         ret, frame = cap.read()
         
         if ret:
-            img_filename = f"scene_{i:03d}.jpg"
+            img_filename = f"scene_{i:03d}_{int(start_time)}s.jpg"
             img_path = os.path.join(OUTPUT_DIR, img_filename)
             cv2.imwrite(img_path, frame)
-            scenes_data[i]["img_path"] = img_path
+            
+            scenes_data.append({
+                "time_str": format_time(start_time),
+                "seconds": start_time,
+                "img_path": img_path
+            })
         
-        progress_bar.progress(min((i + 1) / total_scenes, 1.0))
+        if total_scenes > 0:
+            progress_bar.progress(min((i + 1) / total_scenes, 1.0))
 
     cap.release()
     progress_bar.empty()
     return scenes_data
 
-# --- 関数: 音声書き起こし ---
+# --- 関数: 音声書き起こし（精度向上版） ---
 @st.cache_resource
 def load_whisper_model():
-    # 精度重視なら small, 更に上げるなら medium
-    return whisper.load_model("small")
+    # ★変更点：精度を上げるため "base" から "small" に変更
+    # クラウドで落ちる場合は "base" に戻してください。
+    # ローカルで余裕があれば "medium" も可。
+    return whisper.load_model("small") 
 
 def transcribe_audio(video_path):
     model = load_whisper_model()
-    with st.spinner("AIが音声を解析しています..."):
+    with st.spinner("AIが音声を解析しています... (モデルを大きくしたため時間がかかります)"):
+        # language="ja" を指定すると認識率が上がることがあります
         result = model.transcribe(video_path, language="ja")
     return result["segments"]
 
-# --- 関数: 精度向上版アライメント（中点ロジック） ---
+# --- 関数: データ結合（今回の肝） ---
 def align_scenes_and_text(scenes, segments):
-    # シーンごとに空のテキストリストを用意
-    for scene in scenes:
-        scene["text_list"] = []
-
-    for segment in segments:
-        # セリフの開始・終了・中間点
-        seg_start = segment["start"]
-        seg_end = segment["end"]
-        seg_mid = (seg_start + seg_end) / 2 # ★ここがポイント
-
-        # 「セリフの中間点」が含まれているシーンを探す
-        matched = False
-        for scene in scenes:
-            # 最後のシーンのend時間が曖昧な場合のガードなどを考慮しつつ判定
-            if scene["start"] <= seg_mid < scene["end"]:
-                scene["text_list"].append(segment["text"])
-                matched = True
-                break
-        
-        # どのシーンにも入らなかった場合（動画最後の余韻など）、最後のシーンに入れる
-        if not matched and scenes:
-             scenes[-1]["text_list"].append(segment["text"])
-
-    # リストを結合して文字列にする
-    for scene in scenes:
-        scene["final_text"] = "\n".join(scene["text_list"])
+    aligned_data = []
     
-    return scenes
+    for i, scene in enumerate(scenes):
+        scene_start = scene["seconds"]
+        # 次のシーンの開始時間を取得（最後のシーンの場合は無限大を設定）
+        next_scene_start = scenes[i+1]["seconds"] if i+1 < len(scenes) else float('inf')
+        
+        # このシーンの区間内に開始時間があるテキストセグメントを探す
+        matched_texts = []
+        for segment in segments:
+            if scene_start <= segment["start"] < next_scene_start:
+                matched_texts.append(segment["text"])
+        
+        # 複数行のテキストを結合（スプシで見やすくするため改行を入れる）
+        combined_text = "\n".join(matched_texts)
+        
+        aligned_data.append({
+            "time": scene["time_str"],
+            "image": scene["img_path"],
+            "text": combined_text
+        })
+    return aligned_data
 
 # ==========================================
 # メインUI
 # ==========================================
-st.set_page_config(page_title="動画解析アプリ Pro v2", layout="wide")
+st.set_page_config(page_title="動画解析アプリPro", layout="wide")
 
-st.title("🎥 動画解析 & スプシ貼り付けツール")
-st.markdown("シーン検出の精度向上と、スプレッドシートへの横並び貼り付けに対応しました。")
+st.title("🎥 動画解析アプリ Pro (スプシ対応版)")
+st.markdown("""
+- **精度向上:** 音声認識モデルを高性能なものに変更しました。
+- **スプシ対応:** シーン画像の下に対応するテキストを配置します。そのままコピペできます。
+""")
 
-uploaded_file = st.file_uploader("動画ファイルをアップロード", type=["mp4", "mov", "avi"])
+uploaded_file = st.file_uploader("動画ファイルをアップロード", type=["mp4", "mov", "avi", "mkv"])
 
 if uploaded_file is not None:
     video_path = os.path.join(UPLOAD_DIR, uploaded_file.name)
     with open(video_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    st.success(f"ファイル準備完了: {uploaded_file.name}")
+    st.success(f"読み込み完了: {uploaded_file.name}")
 
-    if st.button("🚀 解析スタート", type="primary"):
+    if st.button("🚀 解析スタート (少し時間がかかります)", type="primary"):
         clear_output_folder()
         
-        # 1. 実行
+        # 1. 処理実行
         scenes = extract_scenes(video_path)
         segments = transcribe_audio(video_path)
         
-        # 2. 結合（精度向上ロジック適用）
+        # 2. 画像とテキストの突き合わせ
         aligned_data = align_scenes_and_text(scenes, segments)
         
         st.divider()
+        st.subheader("📊 解析結果 (スプレッドシート用レイアウト)")
+        st.info("💡 ヒント: 画像の行からテキストの行までドラッグして選択し、ExcelやGoogleスプレッドシートに貼り付けてください。")
 
-        # --- 表示エリア ---
-        st.subheader("1. 解析結果プレビュー")
-        
-        # 3列ごとに折り返して表示
-        cols = st.columns(3)
-        for i, item in enumerate(aligned_data):
-            with cols[i % 3]:
-                if item["img_path"]:
-                    st.image(item["img_path"], use_column_width=True)
-                st.caption(f"シーン {i+1} ({item['time_str']}~)")
-                st.text_area("内容", item["final_text"], height=100, key=f"t_{i}")
+        if not aligned_data:
+            st.warning("データが抽出できませんでした。")
+        else:
+            # --- スプシ用レイアウト表示 ---
+            # Streamlitで横並びを綺麗にコピペさせるため、少し特殊な表示をします。
+            
+            num_scenes = len(aligned_data)
+            
+            # 1行目：時間表示
+            cols_time = st.columns(num_scenes)
+            for i, col in enumerate(cols_time):
+                col.write(f"**{aligned_data[i]['time']}**")
+            
+            # 2行目：画像表示
+            cols_img = st.columns(num_scenes)
+            for i, col in enumerate(cols_img):
+                col.image(aligned_data[i]["image"], use_column_width=True)
+                
+            # 3行目：テキスト表示 (テキストエリアを使うとコピペしやすい)
+            cols_text = st.columns(num_scenes)
+            for i, col in enumerate(cols_text):
+                # height調整で見た目を揃える
+                col.text_area("テキスト", aligned_data[i]["text"], height=150, label_visibility="hidden", key=f"text_{i}")
 
-        st.divider()
-
-        # --- スプシ用コピーエリア ---
-        st.subheader("2. スプレッドシート貼り付け用データ")
-        st.markdown("""
-        以下のボックスの右上にある **コピーボタン** を押してください。  
-        その後、スプレッドシートのセルを選んで貼り付けると、**横一列にシーンごとのテキストが入ります。**
-        """)
-
-        # タブ区切りテキスト(TSV)を作成
-        # joinするときにタブ(\t)を使うことで、エクセル等は「隣のセル」と認識します
-        tsv_text = "\t".join([item["final_text"].replace("\n", " ") for item in aligned_data])
-        
-        # st.codeを使ってコピーボタン付きのボックスを表示
-        st.code(tsv_text, language="text")
+            st.divider()
+            
+            # データフレームでもダウンロードできるようにする
+            df = pd.DataFrame(aligned_data)
+            csv = df.to_csv(index=False).encode('utf-8_sig')
+            st.download_button(
+                "📥 CSVでダウンロード",
+                csv,
+                "video_analysis.csv",
+                "text/csv",
+                 key='download-csv'
+            )
