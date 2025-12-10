@@ -95,7 +95,7 @@ def extract_scenes(video_path):
 @st.cache_resource
 def load_whisper_model():
     # 精度重視なら small, 更に上げるなら medium
-    return whisper.load_model("base")
+    return whisper.load_model("small")
 
 def transcribe_audio(video_path):
     model = load_whisper_model()
