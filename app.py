@@ -5,10 +5,12 @@ import subprocess
 import base64
 import whisper
 
+
 # ==============================
-# Streamlit 設定
+# Streamlit 基本設定
 # ==============================
 st.set_page_config(page_title="動画シーン解析ツール", layout="wide")
+
 st.markdown("""
 <style>
 .scene-container {
@@ -43,10 +45,11 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🎬 動画シーン解析ツール（MacBook向けリライト版）")
+st.title("🎬 動画シーン解析ツール（moviepy なし版）")
+
 
 # ==============================
-# 動画秒数取得
+# FFprobe で動画秒数を取得
 # ==============================
 def get_video_duration(video_path):
     cmd = [
@@ -59,62 +62,71 @@ def get_video_duration(video_path):
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return float(result.stdout.decode().strip())
 
+
 # ==============================
 # シーン抽出（FFmpeg）
 # ==============================
 def extract_scenes_ffmpeg(video_path):
     tmp_dir = tempfile.mkdtemp()
+
     threshold = "0.3"
+
     cmd = [
         "ffmpeg",
         "-i", video_path,
-        "-vf",
-        f"select='gt(scene,{threshold})',metadata=print",
+        "-vf", f"select='gt(scene,{threshold})',metadata=print",
         "-vsync", "vfr",
         os.path.join(tmp_dir, "scene_%04d.jpg")
     ]
+
     subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
     image_paths = sorted(
         [os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir) if f.endswith(".jpg")]
     )
     return image_paths
 
+
 # ==============================
-# Whisper-small 音声解析
+# Whisper でテキスト抽出
 # ==============================
 @st.cache_resource
 def load_whisper():
     return whisper.load_model("small")
 
+
 def transcribe_audio(video_path):
     model = load_whisper()
-    result = model.transcribe(video_path, fp16=False, language="ja")
+    result = model.transcribe(video_path, fp16=False)
     return result["text"]
 
+
 # ==============================
-# TSV（横3行×n列）
+# TSV（横 3 行 × n 列）
 # ==============================
 def generate_tsv_horizontal(image_paths, times, transcripts):
     time_row = ["時間"] + [str(t) for t in times]
+
     image_row = ["画像"]
     for img in image_paths:
         with open(img, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
         formula = f'=IMAGE("data:image/jpeg;base64,{b64}")'
         image_row.append(formula)
+
     text_row = ["テキスト"] + transcripts
+
     return "\n".join([
         "\t".join(time_row),
         "\t".join(image_row),
         "\t".join(text_row)
     ])
 
+
 # ==============================
 # メイン処理
 # ==============================
-uploaded = st.file_uploader(
-    "動画ファイル（mp4 / mov）をアップロード", type=["mp4", "mov"]
-)
+uploaded = st.file_uploader("動画ファイル（mp4 / mov）をアップロード", type=["mp4", "mov"])
 
 if uploaded:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
@@ -123,24 +135,27 @@ if uploaded:
 
     st.success("動画を読み込みました！")
 
+    # 動画秒数取得（moviepy 不要）
     duration = get_video_duration(video_path)
     st.write(f"動画の長さ：{duration:.1f} 秒")
 
+    # シーン抽出
     with st.spinner("シーン抽出中…"):
         scene_images = extract_scenes_ffmpeg(video_path)
+
     st.write(f"抽出シーン数：{len(scene_images)}")
 
-    # シーン秒数（均等割り）
+    # シーン秒数（推定）
     times = []
     for i, img in enumerate(scene_images):
         sec = round(i * (duration / max(1, len(scene_images))), 1)
         times.append(sec)
 
-    # Whisper-small
-    with st.spinner("音声解析中…"):
+    # Whisper
+    with st.spinner("Whisper-small で音声解析中…"):
         transcript = transcribe_audio(video_path)
 
-    # 均等に分割
+    # シーン単位に均等割り
     words = transcript.split()
     chunk = len(scene_images)
     transcripts = []
@@ -151,13 +166,15 @@ if uploaded:
             transcripts.append(" ".join(part))
 
     # ==============================
-    # UI（横スクロールカード）
+    # UI（横カード）
     # ==============================
-    st.subheader("🔍 自動抽出シーン（横スクロール）")
+    st.subheader("🔍 自動抽出されたシーン")
+
     html = '<div class="scene-container">'
     for img, t, tx in zip(scene_images, times, transcripts):
         with open(img, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
+
         html += f"""
         <div class="scene-card">
             <img class="scene-img" src="data:image/jpeg;base64,{b64}">
@@ -169,10 +186,11 @@ if uploaded:
     st.markdown(html, unsafe_allow_html=True)
 
     # ==============================
-    # TSV出力
+    # TSV 出力
     # ==============================
-    st.subheader("📋 Googleスプレッドシート用 TSV（横3行×n列）")
+    st.subheader("📋 Google スプレッドシート用 TSV（横3行×n列）")
+
     if st.button("TSV を生成"):
         tsv = generate_tsv_horizontal(scene_images, times, transcripts)
         st.code(tsv, language="text")
-        st.success("そのままスプレッドシートに貼り付け可能！")
+        st.success("このままスプレッドシートに貼り付け可能！")
