@@ -1,162 +1,190 @@
 import streamlit as st
-import tempfile
 import os
-import whisper
 import cv2
-from PIL import Image
-import numpy as np
+import whisper
+import shutil
 import base64
+from scenedetect import VideoManager, SceneManager
+from scenedetect.detectors import ContentDetector
 
-# Whisperモデルのロード（smallで安定）
-@st.cache_resource
-def load_model():
-    return whisper.load_model("small")
+# ====== 設定 ====== #
+UPLOAD_DIR = "temp_uploads"
+OUTPUT_DIR = "temp_outputs"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-model = load_model()
+st.set_page_config(page_title="動画解析 Pro", layout="wide")
 
-st.title("動画シーン × テキスト抽出ツール")
+# ====== CSS カスタム ====== #
+st.markdown("""
+<style>
+/* 全体フォント */
+html, body, [class*="css"]  {
+    font-family: "Inter", "Noto Sans JP", sans-serif;
+}
 
-uploaded_file = st.file_uploader("動画ファイルをアップロード", type=["mp4", "mov", "mkv"])
+/* 横スクロールコンテナ */
+.scene-container {
+    display: flex;
+    flex-direction: row;
+    overflow-x: auto;
+    gap: 20px;
+    padding-bottom: 20px;
+    white-space: nowrap;
+}
 
-if uploaded_file is not None:
+/* 1シーンのカードデザイン */
+.scene-card {
+    display: inline-block;
+    width: 280px;
+    background: #ffffff10;
+    backdrop-filter: blur(6px);
+    padding: 12px;
+    border-radius: 14px;
+    box-shadow: 0px 4px 14px rgba(0,0,0,0.1);
+    border: 1px solid rgba(255,255,255,0.15);
+}
 
-    # 一時保存
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-        tmp.write(uploaded_file.read())
-        video_path = tmp.name
+/* サムネイル画像 */
+.scene-img {
+    width: 100%;
+    border-radius: 10px;
+    margin-bottom: 8px;
+    border: 1px solid #ddd;
+}
 
-    st.video(uploaded_file)
+/* テキスト領域 */
+.scene-text {
+    font-size: 14px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+}
+</style>
+""", unsafe_allow_html=True)
 
-    st.write("### ① シーン検出中...")
 
-    # --- シーン検出 ---
-    def detect_scenes(video_path, threshold=30, min_scene_len=1):
-        cap = cv2.VideoCapture(video_path)
-        scenes = []
-        last_frame = None
-        start_time = 0
+# ====== 関数類 ====== #
 
-        frame_count = 0
-        fps = cap.get(cv2.CAP_PROP_FPS)
+def clear_output_folder():
+    if os.path.exists(OUTPUT_DIR):
+        shutil.rmtree(OUTPUT_DIR)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+def format_time(seconds):
+    seconds = int(seconds)
+    m = seconds // 60
+    s = seconds % 60
+    return f"{m:02}:{s:02}"
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            if last_frame is not None:
-                diff = cv2.absdiff(gray, last_frame)
-                score = diff.mean()
+def extract_scenes(video_path):
+    video_manager = VideoManager([video_path])
+    scene_manager = SceneManager()
+    scene_manager.add_detector(ContentDetector(threshold=27.0))
 
-                if score > threshold:
-                    end_time = frame_count / fps
-                    if end_time - start_time >= min_scene_len:
-                        scenes.append((start_time, end_time))
-                    start_time = end_time
+    video_manager.start()
+    scene_manager.detect_scenes(frame_source=video_manager)
+    scene_list = scene_manager.get_scene_list()
 
-            last_frame = gray
-            frame_count += 1
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    duration = frame_count / fps
 
-        cap.release()
-        return scenes
+    scenes = []
+    if not scene_list or scene_list[0][0].get_seconds() > 1.0:
+        scenes.append({"start": 0.0, "end": scene_list[0][0].get_seconds() if scene_list else duration})
 
-    scenes = detect_scenes(video_path)
-    st.success(f"{len(scenes)} 個のシーンを検出しました")
+    for s in scene_list:
+        scenes.append({"start": s[0].get_seconds(), "end": s[1].get_seconds()})
 
-    st.write("### ② Whisperで音声→テキスト変換中...（精度強化）")
-
-    # Whisper 高精度設定
-    result = model.transcribe(
-        audio=video_path,
-        verbose=True,
-        temperature=0.0,
-        condition_on_previous_text=True,
-        fp16=False
-    )
-
-    segments = result["segments"]
-
-    # --- セグメントをシーンごとにマッピング ---
-    def match_segments_to_scenes(scenes, segments):
-        scene_texts = []
-        for (start, end) in scenes:
-            text = ""
-            for seg in segments:
-                if seg["start"] >= start and seg["start"] <= end:
-                    text += seg["text"] + " "
-            scene_texts.append(text.strip())
-        return scene_texts
-
-    scene_texts = match_segments_to_scenes(scenes, segments)
-
-    st.write("### ③ シーンごとの画像＆テキスト生成中...")
-
-    # スクショ作成
-    def capture_frame_at(video_path, time_sec):
-        cap = cv2.VideoCapture(video_path)
-        cap.set(cv2.CAP_PROP_POS_MSEC, time_sec * 1000)
+    # 画像保存
+    for i, sc in enumerate(scenes):
+        cap.set(cv2.CAP_PROP_POS_MSEC, int((sc["start"] + 0.3) * 1000))
         ret, frame = cap.read()
-        cap.release()
-        if not ret:
-            return None
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        return Image.fromarray(frame)
+        if ret:
+            filename = f"scene_{i:03}.jpg"
+            cv2.imwrite(os.path.join(OUTPUT_DIR, filename), frame)
+            sc["img"] = os.path.join(OUTPUT_DIR, filename)
 
-    screenshots = []
-    for (start, end) in scenes:
-        mid = (start + end) / 2
-        img = capture_frame_at(video_path, mid)
-        screenshots.append(img)
+        sc["time_str"] = format_time(sc["start"])
 
-    # ---- 横スクロール表示 ----
-    st.write("### ④ シーン一覧（横スクロール）")
+    cap.release()
+    return scenes
 
-    # CSS で横スクロールコンテナを作成
-    st.markdown("""
-    <style>
-    .scroll-container {
-        display: flex;
-        overflow-x: auto;
-        gap: 20px;
-        padding-bottom: 20px;
-        white-space: nowrap;
-    }
-    .scene-item {
-        display: inline-block;
-        text-align: center;
-        width: 300px;
-    }
-    .scene-img {
-        width: 100%;
-        border-radius: 8px;
-    }
-    .scene-text {
-        font-size: 14px;
-        margin-top: 8px;
-        background: #f0f0f0;
-        padding: 8px;
-        border-radius: 6px;
-    }
-    </style>
-    """, unsafe_allow_html=True)
 
-    html = '<div class="scroll-container">'
+@st.cache_resource
+def load_whisper():
+    return whisper.load_model("small")   # ←精度UP
 
-    for img, text in zip(screenshots, scene_texts):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_img:
-            img.save(tmp_img.name)
-            img_path = tmp_img.name
 
-        html += f"""
-        <div class="scene-item">
-            <img src="data:image/jpeg;base64,{base64.b64encode(open(img_path,'rb').read()).decode()}" class="scene-img"/>
-            <div class="scene-text">{text}</div>
-        </div>
-        """
+def transcribe_audio(path):
+    model = load_whisper()
+    result = model.transcribe(path, language="ja")
+    return result["segments"]
 
-    html += "</div>"
 
-    st.markdown(html, unsafe_allow_html=True)
+def align(scenes, segments):
+    for sc in scenes:
+        sc["text"] = ""
 
+    for seg in segments:
+        mid = (seg["start"] + seg["end"]) / 2
+        for sc in scenes:
+            if sc["start"] <= mid < sc["end"]:
+                sc["text"] += seg["text"] + "\n"
+                break
+        else:
+            scenes[-1]["text"] += seg["text"] + "\n"
+
+    return scenes
+
+
+# ====== UI ====== #
+
+st.title("🎥 動画解析 Pro（UI強化版）")
+uploaded = st.file_uploader("動画ファイルをアップロード", type=["mp4", "mov", "avi"])
+
+if uploaded is not None:
+    video_path = os.path.join(UPLOAD_DIR, uploaded.name)
+    with open(video_path, "wb") as f:
+        f.write(uploaded.getbuffer())
+
+    st.success("動画アップロード完了！")
+
+    if st.button("🚀 解析スタート", type="primary"):
+        clear_output_folder()
+
+        with st.spinner("シーン抽出中..."):
+            scenes = extract_scenes(video_path)
+
+        with st.spinner("音声解析中...（Whisper small）"):
+            segments = transcribe_audio(video_path)
+
+        scenes = align(scenes, segments)
+
+        st.subheader("🎬 シーン一覧（横スクロール可）")
+
+        # ===== 横スクロール HTML生成 ===== #
+        html = """<div class="scene-container">"""
+
+        for sc in scenes:
+            with open(sc["img"], "rb") as f:
+                encoded = base64.b64encode(f.read()).decode()
+
+            html += f"""
+            <div class="scene-card">
+                <img src="data:image/jpeg;base64,{encoded}" class="scene-img" />
+                <div><b>⏱ {sc['time_str']}〜</b></div>
+                <div class="scene-text">{sc['text']}</div>
+            </div>
+            """
+
+        html += "</div>"
+
+        st.markdown(html, unsafe_allow_html=True)
+
+        st.subheader("📊 スプレッドシート用（横並び）")
+
+        tsv = "\t".join([s["text"].replace("\n", " ") for s in scenes])
+        st.code(tsv, language="text")
