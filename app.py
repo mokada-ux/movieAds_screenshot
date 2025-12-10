@@ -1,6 +1,7 @@
 import streamlit as st
 import os
 import base64
+import html
 from PIL import Image
 import pytesseract
 
@@ -69,30 +70,30 @@ if not uploaded_files:
 # ==============================
 st.subheader("📷 解析結果（横スクロールできます）")
 
-html = '<div class="scene-container">'
+html_out = '<div class="scene-container">'
 
-for i, file in enumerate(uploaded_files):
+for file in uploaded_files:
     img = Image.open(file)
 
     # base64 エンコード
     b64 = base64.b64encode(file.getvalue()).decode()
 
-    # OCR
+    # OCR → HTML エスケープ
     try:
-        extracted_text = pytesseract.image_to_string(img, lang="jpn+eng")
+        raw_text = pytesseract.image_to_string(img, lang="jpn+eng")
+        extracted_text = html.escape(raw_text)  # ← これが壊れ対策の本命！！！
     except:
         extracted_text = "OCR failed"
 
     # 1枚分のカード HTML
-    html += f"""
+    html_out += f"""
     <div class="scene-card">
         <img src="data:image/jpeg;base64,{b64}" class="scene-img"/>
         <div class="scene-text">{extracted_text}</div>
     </div>
     """
 
-html += "</div>"
+html_out += "</div>"
 
 # 表示
-st.markdown(html, unsafe_allow_html=True)
-
+st.markdown(html_out, unsafe_allow_html=True)
