@@ -4,3 +4,6 @@ libglib2.0-0
 libsm6
 libxext6
 libxrender1
+tesseract-ocr
+tesseract-ocr-jpn
+tesseract-ocr-jpn-vert
