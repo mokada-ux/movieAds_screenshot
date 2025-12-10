@@ -1,6 +1,6 @@
 streamlit
 openai-whisper
-scenedetect[opencv]
+scenedetect
 opencv-python-headless
 numpy
 pandas
