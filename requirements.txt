@@ -3,3 +3,4 @@ openai-whisper
 scenedetect[opencv]
 opencv-python-headless
 numpy
+pandas
