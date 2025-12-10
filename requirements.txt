@@ -4,3 +4,4 @@ scenedetect
 opencv-python-headless
 numpy
 pandas
+tqdm
