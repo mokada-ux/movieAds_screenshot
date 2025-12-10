@@ -5,6 +5,7 @@ import whisper
 import cv2
 from PIL import Image
 import numpy as np
+import base64
 
 # Whisperモデルのロード（smallで安定）
 @st.cache_resource
