@@ -1,196 +1,93 @@
 import streamlit as st
 import os
-import tempfile
-import subprocess
-import base64
+import cv2
 import whisper
+import shutil
+import datetime
+# pandasはデータ整形用
+import pandas as pd
+from scenedetect import VideoManager, SceneManager
+from scenedetect.detectors import ContentDetector
 
+# --- 設定 ---
+UPLOAD_DIR = "temp_uploads"
+OUTPUT_DIR = "temp_outputs"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ==============================
-# Streamlit 基本設定
-# ==============================
-st.set_page_config(page_title="動画シーン解析ツール", layout="wide")
+# --- 関数: 時間表示 ---
+def format_time(seconds):
+    seconds = int(seconds)
+    minutes = seconds // 60
+    rem_seconds = seconds % 60
+    return f"{minutes:02}:{rem_seconds:02}"
 
-st.markdown("""
-<style>
-.scene-container {
-    display: flex;
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    gap: 20px;
-    padding: 10px;
-}
-.scene-card {
-    flex: 0 0 auto;
-    width: 260px;
-    background: #ffffff10;
-    padding: 12px;
-    border-radius: 12px;
-    border: 1px solid #888;
-}
-.scene-img {
-    width: 100%;
-    border-radius: 8px;
-    border: 1px solid #666;
-}
-.scene-time {
-    font-size: 14px;
-    margin-top: 6px;
-    color: #ddd;
-}
-.scene-text {
-    font-size: 15px;
-    margin-top: 6px;
-}
-</style>
-""", unsafe_allow_html=True)
+# --- 関数: フォルダリセット ---
+def clear_output_folder():
+    if os.path.exists(OUTPUT_DIR):
+        shutil.rmtree(OUTPUT_DIR)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-st.title("🎬 動画シーン解析ツール（moviepy なし版）")
-
-
-# ==============================
-# FFprobe で動画秒数を取得
-# ==============================
-def get_video_duration(video_path):
-    cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        video_path
-    ]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    return float(result.stdout.decode().strip())
-
-
-# ==============================
-# シーン抽出（FFmpeg）
-# ==============================
-def extract_scenes_ffmpeg(video_path):
-    tmp_dir = tempfile.mkdtemp()
-
-    threshold = "0.3"
-
-    cmd = [
-        "ffmpeg",
-        "-i", video_path,
-        "-vf", f"select='gt(scene,{threshold})',metadata=print",
-        "-vsync", "vfr",
-        os.path.join(tmp_dir, "scene_%04d.jpg")
-    ]
-
-    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-    image_paths = sorted(
-        [os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir) if f.endswith(".jpg")]
-    )
-    return image_paths
-
-
-# ==============================
-# Whisper でテキスト抽出
-# ==============================
-@st.cache_resource
-def load_whisper():
-    return whisper.load_model("small")
-
-
-def transcribe_audio(video_path):
-    model = load_whisper()
-    result = model.transcribe(video_path, fp16=False)
-    return result["text"]
-
-
-# ==============================
-# TSV（横 3 行 × n 列）
-# ==============================
-def generate_tsv_horizontal(image_paths, times, transcripts):
-    time_row = ["時間"] + [str(t) for t in times]
-
-    image_row = ["画像"]
-    for img in image_paths:
-        with open(img, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
-        formula = f'=IMAGE("data:image/jpeg;base64,{b64}")'
-        image_row.append(formula)
-
-    text_row = ["テキスト"] + transcripts
-
-    return "\n".join([
-        "\t".join(time_row),
-        "\t".join(image_row),
-        "\t".join(text_row)
-    ])
-
-
-# ==============================
-# メイン処理
-# ==============================
-uploaded = st.file_uploader("動画ファイル（mp4 / mov）をアップロード", type=["mp4", "mov"])
-
-if uploaded:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-        tmp.write(uploaded.read())
-        video_path = tmp.name
-
-    st.success("動画を読み込みました！")
-
-    # 動画秒数取得（moviepy 不要）
-    duration = get_video_duration(video_path)
-    st.write(f"動画の長さ：{duration:.1f} 秒")
-
-    # シーン抽出
-    with st.spinner("シーン抽出中…"):
-        scene_images = extract_scenes_ffmpeg(video_path)
-
-    st.write(f"抽出シーン数：{len(scene_images)}")
-
-    # シーン秒数（推定）
-    times = []
-    for i, img in enumerate(scene_images):
-        sec = round(i * (duration / max(1, len(scene_images))), 1)
-        times.append(sec)
-
-    # Whisper
-    with st.spinner("Whisper-small で音声解析中…"):
-        transcript = transcribe_audio(video_path)
-
-    # シーン単位に均等割り
-    words = transcript.split()
-    chunk = len(scene_images)
-    transcripts = []
-    if chunk > 0:
-        split_size = max(1, len(words) // chunk)
-        for i in range(chunk):
-            part = words[i * split_size:(i + 1) * split_size]
-            transcripts.append(" ".join(part))
-
-    # ==============================
-    # UI（横カード）
-    # ==============================
-    st.subheader("🔍 自動抽出されたシーン")
-
-    html = '<div class="scene-container">'
-    for img, t, tx in zip(scene_images, times, transcripts):
-        with open(img, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
-
-        html += f"""
-        <div class="scene-card">
-            <img class="scene-img" src="data:image/jpeg;base64,{b64}">
-            <div class="scene-time">⏱ {t} 秒</div>
-            <div class="scene-text">{tx}</div>
-        </div>
-        """
-    html += "</div>"
-    st.markdown(html, unsafe_allow_html=True)
-
-    # ==============================
-    # TSV 出力
-    # ==============================
-    st.subheader("📋 Google スプレッドシート用 TSV（横3行×n列）")
-
-    if st.button("TSV を生成"):
-        tsv = generate_tsv_horizontal(scene_images, times, transcripts)
-        st.code(tsv, language="text")
-        st.success("このままスプレッドシートに貼り付け可能！")
+# --- 関数: シーン抽出 ---
+def extract_scenes(video_path):
+    # シーン検出器のセットアップ
+    video_manager = VideoManager([video_path])
+    scene_manager = SceneManager()
+    # 動きの感度設定（数字が大きいほど敏感）
+    scene_manager.add_detector(ContentDetector(threshold=27.0))
+    
+    video_manager.start()
+    scene_manager.detect_scenes(frame_source=video_manager)
+    scene_list = scene_manager.get_scene_list()
+    
+    # 画像保存の準備
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    duration = frame_count / fps if fps > 0 else 0
+    
+    scenes_data = []
+    
+    # シーンリストが空の場合の保険（動画全体を1シーンとする）
+    if not scene_list:
+        scenes_data.append({
+            "start": 0.0,
+            "end": duration,
+            "time_str": format_time(0),
+            "img_path": None
+        })
+    else:
+        # 最初のシーンが0秒から始まっていない場合の補正
+        if scene_list[0][0].get_seconds() > 1.0:
+            scenes_data.append({
+                "start": 0.0,
+                "end": scene_list[0][0].get_seconds(),
+                "time_str": format_time(0),
+                "img_path": None
+            })
+        
+        for scene in scene_list:
+            start = scene[0].get_seconds()
+            end = scene[1].get_seconds()
+            scenes_data.append({
+                "start": start,
+                "end": end,
+                "time_str": format_time(start),
+                "img_path": None
+            })
+    
+    # 画像キャプチャ処理
+    progress_bar = st.progress(0, text="シーン画像を抽出中...")
+    total_scenes = len(scenes_data)
+    
+    for i, data in enumerate(scenes_data):
+        # シーン開始直後より少し後（0.5秒後）を撮ることでブレを防ぐ
+        capture_point = data["start"] + 0.5
+        if capture_point >= data["end"]:
+            capture_point = data["start"] # シーンが短すぎる場合は開始点
+            
+        cap.set(cv2.CAP_PROP_POS_MSEC, capture_point * 1000)
+        ret, frame = cap.read()
+        
+        if ret:
+            img_filename =
