@@ -4,8 +4,6 @@ import cv2
 import whisper
 import shutil
 import datetime
-# pandasはデータ整形用
-import pandas as pd
 from scenedetect import VideoManager, SceneManager
 from scenedetect.detectors import ContentDetector
 
@@ -30,17 +28,14 @@ def clear_output_folder():
 
 # --- 関数: シーン抽出 ---
 def extract_scenes(video_path):
-    # シーン検出器のセットアップ
     video_manager = VideoManager([video_path])
     scene_manager = SceneManager()
-    # 動きの感度設定（数字が大きいほど敏感）
     scene_manager.add_detector(ContentDetector(threshold=27.0))
     
     video_manager.start()
     scene_manager.detect_scenes(frame_source=video_manager)
     scene_list = scene_manager.get_scene_list()
     
-    # 画像保存の準備
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
@@ -48,7 +43,6 @@ def extract_scenes(video_path):
     
     scenes_data = []
     
-    # シーンリストが空の場合の保険（動画全体を1シーンとする）
     if not scene_list:
         scenes_data.append({
             "start": 0.0,
@@ -57,7 +51,6 @@ def extract_scenes(video_path):
             "img_path": None
         })
     else:
-        # 最初のシーンが0秒から始まっていない場合の補正
         if scene_list[0][0].get_seconds() > 1.0:
             scenes_data.append({
                 "start": 0.0,
@@ -76,15 +69,13 @@ def extract_scenes(video_path):
                 "img_path": None
             })
     
-    # 画像キャプチャ処理
     progress_bar = st.progress(0, text="シーン画像を抽出中...")
     total_scenes = len(scenes_data)
     
     for i, data in enumerate(scenes_data):
-        # シーン開始直後より少し後（0.5秒後）を撮ることでブレを防ぐ
         capture_point = data["start"] + 0.5
         if capture_point >= data["end"]:
-            capture_point = data["start"] # シーンが短すぎる場合は開始点
+            capture_point = data["start"]
             
         cap.set(cv2.CAP_PROP_POS_MSEC, capture_point * 1000)
         ret, frame = cap.read()
@@ -105,39 +96,30 @@ def extract_scenes(video_path):
 # --- 関数: 音声書き起こし ---
 @st.cache_resource
 def load_whisper_model():
-    # クラウド環境のメモリ制限対策として "base" を使用
     return whisper.load_model("base")
 
 def transcribe_audio(video_path):
     model = load_whisper_model()
     with st.spinner("AIが音声を解析しています..."):
-        # 日本語指定で精度アップ
         result = model.transcribe(video_path, language="ja")
     return result["segments"]
 
-# --- 関数: 結合ロジック（中点合わせ） ---
+# --- 関数: 結合ロジック ---
 def align_scenes_and_text(scenes, segments):
-    # シーンごとにテキストリストを初期化
     for scene in scenes:
         scene["text_list"] = []
 
     for segment in segments:
-        # セリフの中間時間を計算
         mid_point = (segment["start"] + segment["end"]) / 2
-        
-        # 中間時間がどのシーンに含まれるか判定
         matched = False
         for scene in scenes:
             if scene["start"] <= mid_point < scene["end"]:
                 scene["text_list"].append(segment["text"])
                 matched = True
                 break
-        
-        # どこにも属さなかった場合（末尾など）、最後のシーンへ
         if not matched and scenes:
             scenes[-1]["text_list"].append(segment["text"])
 
-    # リストを結合
     for scene in scenes:
         scene["final_text"] = "\n".join(scene["text_list"])
     
@@ -154,7 +136,6 @@ st.markdown("Streamlit Cloud対応版：シーン画像抽出と文字起こし�
 uploaded_file = st.file_uploader("動画ファイルをアップロード (MP4推奨)", type=["mp4", "mov", "avi"])
 
 if uploaded_file is not None:
-    # 一時保存
     video_path = os.path.join(UPLOAD_DIR, uploaded_file.name)
     with open(video_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
@@ -174,23 +155,43 @@ if uploaded_file is not None:
             
             st.divider()
 
-            # --- A. プレビュー表示 ---
+            # --- A. プレビュー表示（レイアウト変更版） ---
             st.subheader("1. 解析結果プレビュー")
-            cols = st.columns(3)
-            for i, item in enumerate(aligned_data):
-                with cols[i % 3]:
-                    if item["img_path"]:
-                        st.image(item["img_path"], use_column_width=True)
-                    st.caption(f"シーン {i+1} ({item['time_str']}~)")
-                    st.text(item["final_text"])
-
-            st.divider()
+            
+            # 1行に表示するシーン数（ここを変えると画像の大きさが変わります）
+            ITEMS_PER_ROW = 15 
+            
+            # データを分割して表示ループ
+            for i in range(0, len(aligned_data), ITEMS_PER_ROW):
+                # 今回表示するバッチ（最大8個）
+                batch = aligned_data[i : i + ITEMS_PER_ROW]
+                cols_count = len(batch)
+                
+                # 1段目：画像 (スクショ)
+                cols_img = st.columns(cols_count)
+                for j, col in enumerate(cols_img):
+                    if batch[j]["img_path"]:
+                        col.image(batch[j]["img_path"], use_column_width=True)
+                
+                # 2段目：時間 (秒数)
+                cols_time = st.columns(cols_count)
+                for j, col in enumerate(cols_time):
+                    # 中央揃えっぽく見せるためにmarkdownを使用
+                    col.markdown(f"**{batch[j]['time_str']}**")
+                
+                # 3段目：テキスト
+                cols_text = st.columns(cols_count)
+                for j, col in enumerate(cols_text):
+                    # テキストエリアの高さを小さくして一覧性を高める
+                    col.text_area("text", batch[j]["final_text"], height=100, label_visibility="collapsed", key=f"txt_{i}_{j}")
+                
+                # 区切り線
+                st.divider()
 
             # --- B. スプシ貼り付け用データ ---
             st.subheader("2. スプレッドシート貼り付け用データ")
             st.info("👇 下のボックスの右上にあるコピーボタンを押し、スプレッドシートのA1セルを選択して貼り付けてください。横一列に展開されます。")
 
-            # タブ区切りデータを作成 (改行はスペースに置換してセル崩れを防止)
             tsv_list = []
             for item in aligned_data:
                 clean_text = item["final_text"].replace("\n", " ").replace("\t", " ")
