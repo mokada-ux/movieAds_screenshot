@@ -201,7 +201,7 @@ if uploaded_file is not None:
             # --- A. プレビュー表示 (8列) ---
             st.subheader("1. 解析結果プレビュー")
             
-            ITEMS_PER_ROW = 8
+            ITEMS_PER_ROW = 30
             
             for i in range(0, len(aligned_data), ITEMS_PER_ROW):
                 batch = aligned_data[i : i + ITEMS_PER_ROW]
