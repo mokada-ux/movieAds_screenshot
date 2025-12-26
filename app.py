@@ -4,7 +4,6 @@ import cv2
 import whisper
 import shutil
 import datetime
-import numpy as np
 from scenedetect import VideoManager, SceneManager
 from scenedetect.detectors import ContentDetector
 
@@ -27,13 +26,12 @@ def clear_output_folder():
         shutil.rmtree(OUTPUT_DIR)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# --- 関数: シーン抽出（結合なし・高感度版） ---
+# --- 関数: シーン抽出 ---
 def extract_scenes(video_path):
     video_manager = VideoManager([video_path])
     scene_manager = SceneManager()
     
-    # threshold=27.0: 標準的な感度。
-    # min_scene_len=15: 0.5秒(15フレーム)程度あればシーンとみなす（以前より細かく検出）
+    # 0.5秒(15フレーム)程度あればシーンとみなす
     scene_manager.add_detector(ContentDetector(threshold=27.0, min_scene_len=15))
     
     video_manager.start()
@@ -45,10 +43,9 @@ def extract_scenes(video_path):
     frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
     duration = frame_count / fps if fps > 0 else 0
     
-    # --- 生のシーンリストをそのまま使用（結合処理を削除）---
     scenes_data = []
     
-    # シーンゼロの場合
+    # シーンがない場合
     if not scene_list:
         scenes_data.append({"start": 0.0, "end": duration})
     else:
@@ -62,16 +59,14 @@ def extract_scenes(video_path):
                 "end": scene[1].get_seconds()
             })
             
-    # 画像保存
     final_scenes = []
-    progress_bar = st.progress(0, text="シーン抽出中 (全カット保持)...")
+    progress_bar = st.progress(0, text="シーン抽出中...")
     total_scenes = len(scenes_data)
 
     for i, scene in enumerate(scenes_data):
         start = scene["start"]
         end = scene["end"]
         
-        # 保存用データ構造
         scene_item = {
             "start": start,
             "end": end,
@@ -80,7 +75,7 @@ def extract_scenes(video_path):
             "text_list": [] 
         }
 
-        # サムネイル位置：シーンの中心、ただし開始から最大1秒地点まで
+        # サムネイル位置調整
         capture_point = start + min((end - start) / 2, 1.0)
         
         cap.set(cv2.CAP_PROP_POS_MSEC, capture_point * 1000)
@@ -100,80 +95,65 @@ def extract_scenes(video_path):
     progress_bar.empty()
     return final_scenes
 
-# --- 関数: 音声書き起こし（精度改善プロンプト付き） ---
+# --- 関数: 音声書き起こし (日本語固定) ---
 @st.cache_resource
 def load_whisper_model():
-    # メモリ制限のためbase固定だが、設定で精度を稼ぐ
     return whisper.load_model("base")
 
-def transcribe_audio(video_path, task_mode):
+def transcribe_audio(video_path):
     model = load_whisper_model()
     
-    # 精度向上のための初期プロンプト（AIへの指示出し）
-    initial_prompt = "ここには動画の音声が含まれています。フィラー（えー、あのー）を除去して、正確な日本語の文章に書き起こしてください。"
+    initial_prompt = "ここには動画の音声が含まれています。フィラーを除去して、正確な日本語の文章に書き起こしてください。"
     
-    with st.spinner("AIが音声を解析中... (精度重視モード)"):
-        # task="translate" にすると英語動画→日本語字幕になります
-        # task="transcribe" は日本語動画→日本語字幕
+    with st.spinner("AIが音声を解析中..."):
+        # task="transcribe" (日本語固定)
         result = model.transcribe(
             video_path, 
-            task=task_mode,
+            language="ja",
             initial_prompt=initial_prompt,
-            condition_on_previous_text=False, # ループ防止
-            no_speech_threshold=0.6 # 無音判定を厳しくしてゴミ文字を減らす
+            condition_on_previous_text=False
         )
     return result["segments"]
 
-# --- 関数: 結合ロジック（重複全適用型） ---
+# --- 関数: 結合ロジック（修正版：一点集中型） ---
 def align_scenes_and_text(scenes, segments):
-    # すべてのテキストセグメントについて
+    # 初期化
+    for scene in scenes:
+        scene["text_list"] = []
+
     for segment in segments:
         seg_start = segment["start"]
         seg_end = segment["end"]
         
-        # すべてのシーンについて確認
+        # セリフの「真ん中の時間」を計算
+        mid_point = (seg_start + seg_end) / 2
+        
+        # 真ん中の時間が含まれるシーン「1つだけ」に割り当てる
+        matched = False
         for scene in scenes:
-            scene_start = scene["start"]
-            scene_end = scene["end"]
-
-            # 【重要】少しでも時間が被っていたら、そのシーンにテキストを表示する
-            # max(開始地点同士) < min(終了地点同士) なら被っている
-            overlap_start = max(seg_start, scene_start)
-            overlap_end = min(seg_end, scene_end)
-
-            # 0.1秒以上の重なりがあれば「関連あり」とみなす
-            if overlap_end - overlap_start > 0.1:
+            if scene["start"] <= mid_point < scene["end"]:
                 scene["text_list"].append(segment["text"])
+                matched = True
+                break # 1つ見つかったら他には入れない（重複防止）
+        
+        # もしどのシーンにも当てはまらなかったら（動画末尾など）、最後のシーンへ
+        if not matched and scenes:
+            scenes[-1]["text_list"].append(segment["text"])
 
-    # リスト結合 & 重複除去（同じテキストが何度も入らないように）
+    # リスト結合
     for scene in scenes:
-        # 順番を保ちつつ重複を消す
-        seen = set()
-        unique_list = []
-        for x in scene["text_list"]:
-            if x not in seen:
-                unique_list.append(x)
-                seen.add(x)
-        scene["final_text"] = "\n".join(unique_list)
+        scene["final_text"] = "\n".join(scene["text_list"])
     
     return scenes
 
 # ==========================================
 # メインUI
 # ==========================================
-st.set_page_config(page_title="動画解析アプリ Ultimate", layout="wide")
+st.set_page_config(page_title="動画解析アプリ Simple", layout="wide")
 
-st.title("🎥 動画解析 & スプシ一括貼り付け (精度強化版)")
+st.title("🎥 動画解析 & スプシ一括貼り付け")
 
-# サイドバー設定
-with st.sidebar:
-    st.header("解析設定")
-    task_mode = st.radio(
-        "処理モードを選択",
-        ("transcribe", "translate"),
-        format_func=lambda x: "文字起こし (日本語→日本語)" if x == "transcribe" else "翻訳 (英語など→日本語)"
-    )
-    st.info("※動画の言語が英語の場合は「翻訳」を選んでください。")
+# サイドバー削除完了。シンプルUIへ。
 
 uploaded_file = st.file_uploader("動画ファイルをアップロード (MP4/MOV)", type=["mp4", "mov", "avi"])
 
@@ -190,8 +170,7 @@ if uploaded_file is not None:
         try:
             # 1. 解析
             scenes = extract_scenes(video_path)
-            # 選択されたモードで実行
-            segments = transcribe_audio(video_path, task_mode)
+            segments = transcribe_audio(video_path) # 引数なし(日本語固定)
             
             # 2. 結合
             aligned_data = align_scenes_and_text(scenes, segments)
@@ -221,8 +200,8 @@ if uploaded_file is not None:
                 # テキスト
                 cols_text = st.columns(cols_count)
                 for j, col in enumerate(cols_text):
-                    # 空白の場合は "(発話なし)" と表示せず、空欄のままにする
                     val = batch[j]["final_text"]
+                    # 何もないときは空欄
                     col.text_area("text", val, height=100, label_visibility="collapsed", key=f"txt_{i}_{j}")
                 
                 st.divider()
@@ -232,7 +211,6 @@ if uploaded_file is not None:
             
             tsv_list = []
             for item in aligned_data:
-                # 改行をスペースに置換
                 clean_text = item["final_text"].replace("\n", " ").replace("\t", " ")
                 tsv_list.append(clean_text)
             
